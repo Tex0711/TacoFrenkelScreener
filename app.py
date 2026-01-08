@@ -4,16 +4,21 @@ import pandas as pd
 from fpdf import FPDF
 from datetime import datetime
 import sys
+import time # <--- NIEUW: De Rem
 
 # --- FUNCTIES: DATA OPHALEN ---
+
 def get_val(df, row_name, col_idx=0):
     if row_name in df.index:
         val = df.loc[row_name].iloc[col_idx]
         return val if pd.notna(val) else 0
     return 0
 
+# <--- NIEUW: CACHING (Het Geheugen)
+# Dit zorgt dat hij data 1 uur (3600 sec) onthoudt, zodat je Yahoo niet onnodig belt.
+@st.cache_data(ttl=3600)
 def get_data(ticker):
-    # Debug info in de logs (niet zichtbaar voor gebruiker)
+    # Debug info
     print(f"Start ophalen data voor: {ticker}")
     
     try:
@@ -22,7 +27,7 @@ def get_data(ticker):
         # Test verbinding
         info = stock.info
         if not info:
-            return None, "Geen data ontvangen. Ticker bestaat niet of Yahoo blokkeert."
+            return None, "Geen data. Ticker bestaat niet of Yahoo blokkeert (wacht even)."
             
         fin = stock.financials
         if fin.empty: 
@@ -40,6 +45,8 @@ def get_data(ticker):
         if price_curr != fin_curr:
             fx_ticker = f"{fin_curr}{price_curr}=X"
             try:
+                # Korte pauze voor valuta check
+                time.sleep(0.5) 
                 fx = yf.Ticker(fx_ticker)
                 hist = fx.history(period="1d")
                 if not hist.empty:
@@ -65,7 +72,7 @@ def get_data(ticker):
         fcf_yield = fcf / market_cap if market_cap else 0
         implied_growth = (0.10 - fcf_yield)
 
-        # 2. ANALISTEN DATA (ROBUUST)
+        # 2. ANALISTEN DATA
         peg_ratio = info.get('pegRatio', None)
         pe_ratio = info.get('trailingPE', info.get('forwardPE', 0))
         earnings_growth = info.get('earningsGrowth', None)
@@ -181,189 +188,4 @@ def get_data(ticker):
                 'Price': f"{price:.2f}",
                 'Valuta': currency_label,
                 'Imp.Gr': f"{implied_growth:.1%}",
-                'Analyst Gr': ws_growth_str,
-                'PEG (Est)': peg_display,
-                'ROIC': f"{roic:.1%}",
-                'ROIIC': f"{roiic:.1%}",
-                'Max Gr': f"{sustainable_growth:.1%}",
-                'Cluster': cluster
-            }
-        }
-        return result, None
-
-    except Exception as e:
-        return None, str(e)
-
-# --- PDF GENERATOR ---
-class PDFReport(FPDF):
-    def header(self):
-        self.set_fill_color(0, 51, 102) 
-        self.rect(0, 0, 210, 25, 'F')
-        self.set_font("Arial", 'B', 16)
-        self.set_text_color(255, 255, 255)
-        self.cell(0, 10, "Taco & Frenkel - Investment Screener", ln=True, align='R')
-        self.set_font("Arial", '', 10)
-        datum = datetime.now().strftime("%d-%m-%Y %H:%M")
-        self.cell(0, 0, f"Gegenereerd op: {datum}", ln=True, align='R')
-        self.ln(20)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Arial", 'I', 8)
-        self.set_text_color(128, 128, 128)
-        self.cell(0, 10, f"Pagina {self.page_no()}", 0, 0, 'C')
-
-def clean_text(text):
-    replacements = { "⚠️": "LET OP:", "🚀": "", "€": "EUR", "✅": "CHECK:", "💡": "TIP:" }
-    for k, v in replacements.items():
-        text = str(text).replace(k, v)
-    return text.encode('latin-1', 'replace').decode('latin-1')
-
-def generate_narrative(data):
-    raw = data['raw']
-    meta = data['meta']
-    text = f"ANALYSIS FOR {meta['ticker']}:\n"
-    text += f"Ons model berekent een Implied Growth van {data['display']['Imp.Gr']}. "
-    if meta['wall_street'] != "N/A":
-        text += f"Wall Street verwacht {meta['wall_street']} groei (o.b.v. {meta['growth_src']}). "
-    
-    if raw['roic'] > 0.20: text += f"\nDe kwaliteit is uitmuntend (ROIC {raw['roic']:.1%}). "
-    elif raw['roic'] < 0.08: text += f"\nDe kwaliteit is zorgwekkend (ROIC {raw['roic']:.1%}). "
-    else: text += f"\nDe kwaliteit is solide (ROIC {raw['roic']:.1%}). "
-
-    if raw['reinvest'] < 0: 
-        text += f"Het bedrijf is een 'Quality Cannibal': ze groeien efficient en kopen eigen aandelen in. "
-    elif raw['reinvest'] > 0.80 and raw['roiic'] > 0.15: 
-        text += f"Agressieve investeringen voor groei ({raw['reinvest']:.1%} reinvestment). "
-    
-    text += f"\n\nCONCLUSIE: {meta['cluster']} - {meta['reason']}"
-    return clean_text(text)
-
-def create_pdf(results_list):
-    pdf = PDFReport()
-    pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.alias_nb_pages()
-    
-    # 1. TABEL
-    pdf.add_page()
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "1. Market Overview", ln=True)
-    pdf.ln(5)
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_font("Arial", 'B', 7)
-    w = [15, 15, 15, 15, 15, 15, 15, 15, 15, 45] 
-    headers = ["Ticker", "Price", "Valuta", "Imp.Gr", "Analyst", "PEG", "ROIC", "ROIIC", "MaxGr", "Cluster"]
-    for i, h in enumerate(headers):
-        pdf.cell(w[i], 8, h, 1, 0, 'C', fill=True)
-    pdf.ln()
-    pdf.set_font("Arial", '', 7)
-    for item in results_list:
-        d = item['display']
-        row_data = [d['Ticker'], d['Price'], d['Valuta'].split(' ')[0], d['Imp.Gr'], d['Analyst Gr'], d['PEG (Est)'], d['ROIC'], d['ROIIC'], d['Max Gr'], clean_text(d['Cluster'])]
-        for i, val in enumerate(row_data):
-            pdf.cell(w[i], 8, str(val).encode('latin-1', 'replace').decode('latin-1'), 1, 0, 'C')
-        pdf.ln()
-
-    # 2. ANALYSES
-    pdf.ln(10)
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "2. Gedetailleerde Analyse", ln=True)
-    for item in results_list:
-        if pdf.get_y() > 230: pdf.add_page()
-        meta = item['meta']
-        display = item['display']
-        narrative = generate_narrative(item)
-        pdf.ln(5)
-        pdf.set_fill_color(230, 240, 255)
-        pdf.set_font("Arial", 'B', 11)
-        pdf.cell(0, 8, f"{clean_text(meta['ticker'])}  |  {clean_text(display['Price'])} {meta['currency']}", ln=True, fill=True, border=1)
-        pdf.set_font("Arial", '', 10)
-        pdf.multi_cell(0, 6, narrative, border='L R B')
-        pdf.ln(2)
-
-    # 3. METHODOLOGIE
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "Bijlage: Methodologie & Beslisboom", ln=True)
-    pdf.set_font("Arial", '', 9)
-    
-    explanation = """
-Dit rapport is gegenereerd door een kwantitatief model.
-
-DEEL 1: DE DRIE PIJLERS
-
-1. Implied Growth (Reverse DCF)
-De kernvraag: "Hoeveel groei prijst de markt in?"
-We gebruiken een omgekeerde Discounted Cash Flow formule:
-- Formule: Implied Growth = Discount Rate (10%) - FCF Yield.
-
-2. Kwaliteit (ROIC)
-De kernvraag: "Hoe efficient is het bedrijf?"
-- Formule: NOPAT / Invested Capital.
-- Norm: >15% is goed. >20% is uitstekend (sterke competitieve positie/Moat).
-
-3. Toekomst (ROIIC & Reinvestment)
-- Sustainable Growth: ROIC * Reinvestment Rate. (Hoe hard kunnen ze groeien op eigen kracht?).
-
-DEEL 2: DE BESLISBOOM (HOE HET MODEL DENKT)
-
-Scenario A: Het Ideale Plaatje (Cluster 1)
-- Criteria: ROIC > 15% EN Implied Growth < Sustainable Growth.
-- Oordeel: BUY. De markt is te pessimistisch.
-
-Scenario B: De 'Cannibal' (bijv. ASML)
-- Probleem: Bedrijven die eigen aandelen inkopen hebben een negatieve Reinvestment Rate.
-- Oplossing: Als ROIC > 15% is en Reinvest < 0, negeren we de groeiformule. We kijken puur of de Implied Growth redelijk is (<10%).
-- Oordeel: BUY (Quality Cannibal).
-
-Scenario C: Hyper-Groei (bijv. Eli Lilly)
-- Probleem: Bij extreem dure aandelen loopt de Implied Growth formule vast.
-- Oplossing: Als Implied Growth de limiet aantikt (>10%), schakelen we over op de PEG-ratio.
-- Check: Is de PEG < 2.0? Dan is de hoge prijs mogelijk gerechtvaardigd.
-
-DEEL 3: DATA HERSTEL
-Yahoo Finance data is niet altijd compleet. Het script gebruikt een waterval-methode:
-1. Analist Groei: We zoeken eerst naar 'Earnings Estimates'.
-2. Fallback: Als dat ontbreekt, kijken we naar 'Revenue Estimates'.
-3. PEG Ratio: Als die ontbreekt, rekenen we hem zelf uit.
-    """
-    pdf.multi_cell(0, 5, clean_text(explanation))
-    
-    return pdf.output(dest='S').encode('latin-1', 'replace') 
-
-# --- DE APP UI ---
-st.set_page_config(page_title="Screener & Report", layout="wide")
-st.title("🚀 Taco & Frenkel - Investment Screener")
-st.info("**Instructies:** Tickers komma gescheiden (NVO, ASML). Voor lokaal: .AS of .CO gebruiken.")
-tickers_input = st.text_area("Tickers:", "NVO, LLY, ASML")
-
-if st.button("🚀 Genereer Rapport"):
-    # --- DE SPION (HIER IS HIJ!) ---
-    # Print direct naar de server logs (zichtbaar in 'Manage app' > 'Logs')
-    print(f"👀 BEZOEK ALERT! Iemand zoekt nu op: {tickers_input} -- {datetime.now()}", flush=True)
-    # -------------------------------
-
-    tickers_list = [t.strip().upper() for t in tickers_input.split(',')]
-    full_results = []
-    table_data = []
-    
-    progress_bar = st.progress(0)
-    
-    for i, ticker in enumerate(tickers_list):
-        # Detective modus: vvang error op
-        data, error_msg = get_data(ticker)
-        
-        if data:
-            full_results.append(data)
-            table_data.append(data['display'])
-        else:
-            st.error(f"❌ Fout bij {ticker}: {error_msg}")
-            
-        progress_bar.progress((i + 1) / len(tickers_list))
-    
-    if full_results:
-        st.subheader("📊 Live Resultaten")
-        st.dataframe(pd.DataFrame(table_data), hide_index=True)
-        pdf_bytes = create_pdf(full_results)
-        st.download_button("📄 Download Rapport (PDF)", pdf_bytes, f"Investment_Report_{datetime.now().strftime('%Y%m%d')}.pdf", "application/pdf")
+                'Analyst Gr': ws_growth
