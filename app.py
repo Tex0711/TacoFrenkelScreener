@@ -344,7 +344,6 @@ st.info("**Instructies:** Tickers komma gescheiden (NVO, ASML). Voor lokaal: .AS
 tickers_input = st.text_area("Tickers:", "NVO, NOVO-B.CO, LLY, ASML, BESI, GOOG, TSLA")
 
 if st.button("🚀 Genereer Rapport"):
-    print(f"👀 BEZOEK ALERT! Iemand zocht op: {tickers_input} om {datetime.now()}", file=sys.stdout)
     tickers_list = [t.strip().upper() for t in tickers_input.split(',')]
     full_results = []
     table_data = []
