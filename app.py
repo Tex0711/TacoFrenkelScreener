@@ -4,7 +4,7 @@ import pandas as pd
 from fpdf import FPDF
 from datetime import datetime
 import sys
-import time # <--- Nodig voor de vertraging
+import time
 
 # --- FUNCTIES: DATA OPHALEN ---
 
@@ -14,28 +14,22 @@ def get_val(df, row_name, col_idx=0):
         return val if pd.notna(val) else 0
     return 0
 
-# CACHING: Onthoud data voor 1 uur (3600 sec) om Yahoo te sparen
 @st.cache_data(ttl=3600)
 def get_data(ticker):
-    # Debug info in logs
     print(f"Start ophalen data voor: {ticker}")
     
     try:
         stock = yf.Ticker(ticker)
-        
-        # Test verbinding
         info = stock.info
-        if not info:
-            return None, "Geen data. Ticker bestaat niet of Yahoo blokkeert."
+        if not info: return None, "Geen data."
             
         fin = stock.financials
-        if fin.empty: 
-            return None, "Geen financiële cijfers beschikbaar."
+        if fin.empty: return None, "Geen financiële cijfers."
             
         bal = stock.balance_sheet
         cf = stock.cashflow
         
-        # 0. VALUTA CHECK
+        # 0. VALUTA
         price_curr = info.get('currency', 'USD')
         fin_curr = info.get('financialCurrency', price_curr)
         conversion_rate = 1.0
@@ -44,7 +38,6 @@ def get_data(ticker):
         if price_curr != fin_curr:
             fx_ticker = f"{fin_curr}{price_curr}=X"
             try:
-                # Korte pauze om API limiet te respecteren
                 time.sleep(0.5) 
                 fx = yf.Ticker(fx_ticker)
                 hist = fx.history(period="1d")
@@ -71,7 +64,7 @@ def get_data(ticker):
         fcf_yield = fcf / market_cap if market_cap else 0
         implied_growth = (0.10 - fcf_yield)
 
-        # 2. ANALISTEN DATA
+        # 2. ANALISTEN & FRENKEL METRIC
         peg_ratio = info.get('pegRatio', None)
         pe_ratio = info.get('trailingPE', info.get('forwardPE', 0))
         earnings_growth = info.get('earningsGrowth', None)
@@ -82,17 +75,17 @@ def get_data(ticker):
         
         if earnings_growth and 0 < earnings_growth < 2.0:
             wall_street_growth = earnings_growth
-            growth_source = "Earnings Est."
+            growth_source = "Earnings"
         elif revenue_growth and revenue_growth > 0:
             wall_street_growth = revenue_growth
-            growth_source = "Revenue Est."
+            growth_source = "Revenue"
         elif peg_ratio and peg_ratio > 0 and pe_ratio > 0:
             wall_street_growth = pe_ratio / peg_ratio
-            growth_source = "Implied by PEG"
+            growth_source = "PEG Implied"
         
         if wall_street_growth == 0 and earnings_growth:
              wall_street_growth = earnings_growth
-             growth_source = "Earnings (Raw)"
+             growth_source = "Earnings Raw"
 
         calc_peg = None
         if wall_street_growth > 0 and pe_ratio > 0:
@@ -136,6 +129,11 @@ def get_data(ticker):
         reinvestment_rate = delta_ic / nopat if nopat > 0 else 0
         sustainable_growth = roic * reinvestment_rate
         
+        # --- DE FRENKEL METER (EXPECTED RETURN) ---
+        # Formule: FCF Yield + Verwachte Groei (Analist of Sustainable)
+        growth_proxy = wall_street_growth if wall_street_growth > 0 else sustainable_growth
+        expected_return = fcf_yield + growth_proxy
+        
         # --- CLUSTER LOGICA ---
         cluster = "NEUTRAAL (Hold)"
         reason = "Waardering en kwaliteit zijn in balans."
@@ -145,23 +143,23 @@ def get_data(ticker):
         if is_cannibal:
             if implied_growth < 0.10:
                 cluster = "BUY (Quality Cannibal)"
-                reason = "Topkwaliteit (hoge ROIC) die eigen aandelen inkoopt. Prijs is redelijk."
+                reason = "Topkwaliteit + eigen inkoop aandelen."
             else:
                 cluster = "HOLD (Expensive Cannibal)"
-                reason = "Topkwaliteit, maar de markt verwacht al >10% groei."
+                reason = "Topkwaliteit, maar geprijsd voor perfectie."
         elif implied_growth > 0.10: 
             if calc_peg and 0.5 < calc_peg < 2.0:
                 cluster = "BUY (Aggressive Growth)"
-                reason = "Duur (Impl.Gr > 10%), maar analisten verwachten explosieve groei (PEG < 2)."
+                reason = "Duur, maar explosieve groei verwacht (PEG < 2)."
             else:
                 cluster = "SPECULATIEF / TE DUUR"
-                reason = "Markt prijst >10% groei in. PEG ratio ondersteunt dit niet overtuigend."
+                reason = "Markt prijst >10% groei in. Pas op."
         elif implied_growth < sustainable_growth and roic > 0.15:
             cluster = "BUY (Cluster 1)"
-            reason = "Markt verwacht minder groei dan bedrijf aankan (Margin of Safety)."
+            reason = "Margin of Safety: Kan harder groeien dan markt verwacht."
         elif roic < 0.08:
             cluster = "AVOID (Value Trap)"
-            reason = "Bedrijf vernietigt waarde (ROIC < 8%)."
+            reason = "Bedrijf vernietigt waarde."
 
         result = {
             'meta': {
@@ -171,8 +169,8 @@ def get_data(ticker):
                 'cluster': cluster,
                 'reason': reason,
                 'wall_street': ws_growth_str,
-                'peg_raw': peg_display,
-                'growth_src': growth_source
+                'growth_src': growth_source,
+                'exp_return': expected_return # Voor narrative
             },
             'raw': {
                 'fcf_yield': fcf_yield,
@@ -187,11 +185,11 @@ def get_data(ticker):
                 'Price': f"{price:.2f}",
                 'Valuta': currency_label,
                 'Imp.Gr': f"{implied_growth:.1%}",
-                'Analyst Gr': ws_growth_str,
-                'PEG (Est)': peg_display,
+                'Exp.Ret': f"{expected_return:.1%}", # NIEUW!
+                'Analyst': ws_growth_str,
+                'PEG': peg_display,
                 'ROIC': f"{roic:.1%}",
                 'ROIIC': f"{roiic:.1%}",
-                'Max Gr': f"{sustainable_growth:.1%}",
                 'Cluster': cluster
             }
         }
@@ -229,16 +227,17 @@ def generate_narrative(data):
     raw = data['raw']
     meta = data['meta']
     text = f"ANALYSIS FOR {meta['ticker']}:\n"
-    text += f"Ons model berekent een Implied Growth van {data['display']['Imp.Gr']}. "
-    if meta['wall_street'] != "N/A":
-        text += f"Wall Street verwacht {meta['wall_street']} groei (o.b.v. {meta['growth_src']}). "
     
-    if raw['roic'] > 0.20: text += f"\nDe kwaliteit is uitmuntend (ROIC {raw['roic']:.1%}). "
-    elif raw['roic'] < 0.08: text += f"\nDe kwaliteit is zorgwekkend (ROIC {raw['roic']:.1%}). "
-    else: text += f"\nDe kwaliteit is solide (ROIC {raw['roic']:.1%}). "
+    # De Frenkel-Nuance
+    text += f"VERWACHTINGEN: Ons model berekent dat het bedrijf {data['display']['Imp.Gr']} moet groeien voor 10% rendement. "
+    text += f"Als we echter uitgaan van de verwachte groei ({meta['wall_street']}), is het Totaal Verwacht Rendement: {data['display']['Exp.Ret']} per jaar.\n"
+    
+    if raw['roic'] > 0.20: text += f"\nKWALITEIT: Uitmuntend (ROIC {raw['roic']:.1%}). "
+    elif raw['roic'] < 0.08: text += f"\nKWALITEIT: Zorgwekkend (ROIC {raw['roic']:.1%}). "
+    else: text += f"\nKWALITEIT: Solide (ROIC {raw['roic']:.1%}). "
 
     if raw['reinvest'] < 0: 
-        text += f"Het bedrijf is een 'Quality Cannibal': ze groeien efficient en kopen eigen aandelen in. "
+        text += f"Het bedrijf is een 'Quality Cannibal' (inkoop eigen aandelen). "
     elif raw['reinvest'] > 0.80 and raw['roiic'] > 0.15: 
         text += f"Agressieve investeringen voor groei ({raw['reinvest']:.1%} reinvestment). "
     
@@ -258,15 +257,17 @@ def create_pdf(results_list):
     pdf.ln(5)
     pdf.set_fill_color(240, 240, 240)
     pdf.set_font("Arial", 'B', 7)
+    # Kolommen aangepast voor Exp.Ret
     w = [15, 15, 15, 15, 15, 15, 15, 15, 15, 45] 
-    headers = ["Ticker", "Price", "Valuta", "Imp.Gr", "Analyst", "PEG", "ROIC", "ROIIC", "MaxGr", "Cluster"]
+    headers = ["Ticker", "Price", "Valuta", "Imp.Gr", "Exp.Ret", "PEG", "ROIC", "ROIIC", "Analyst", "Cluster"]
     for i, h in enumerate(headers):
         pdf.cell(w[i], 8, h, 1, 0, 'C', fill=True)
     pdf.ln()
     pdf.set_font("Arial", '', 7)
     for item in results_list:
         d = item['display']
-        row_data = [d['Ticker'], d['Price'], d['Valuta'].split(' ')[0], d['Imp.Gr'], d['Analyst Gr'], d['PEG (Est)'], d['ROIC'], d['ROIIC'], d['Max Gr'], clean_text(d['Cluster'])]
+        # Volgorde moet kloppen met headers!
+        row_data = [d['Ticker'], d['Price'], d['Valuta'].split(' ')[0], d['Imp.Gr'], d['Exp.Ret'], d['PEG'], d['ROIC'], d['ROIIC'], d['Analyst'], clean_text(d['Cluster'])]
         for i, val in enumerate(row_data):
             pdf.cell(w[i], 8, str(val).encode('latin-1', 'replace').decode('latin-1'), 1, 0, 'C')
         pdf.ln()
@@ -288,57 +289,27 @@ def create_pdf(results_list):
         pdf.multi_cell(0, 6, narrative, border='L R B')
         pdf.ln(2)
 
-    # 3. METHODOLOGIE (UITGEBREID)
+    # 3. METHODOLOGIE
     pdf.add_page()
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "Bijlage: Methodologie & Beslisboom", ln=True)
+    pdf.cell(0, 10, "Bijlage: Methodologie (Met Frenkel-Metric)", ln=True)
     pdf.set_font("Arial", '', 9)
-    
     explanation = """
-Dit rapport is gegenereerd door een kwantitatief model. Hieronder leest u exact hoe het model redeneert, welke formules gebruikt worden en welke 'vangnetten' zijn ingebouwd voor uitzonderlijke situaties.
+Dit rapport hanteert twee perspectieven op waarde:
 
-DEEL 1: DE DRIE PIJLERS
+PERSPECTIEF 1: "WAT IS NODIG?" (De Taco-Methode)
+Variabele: Implied Growth.
+Vraag: Ik WIL 10% rendement. Hoe hard MOET het bedrijf groeien om dat te geven?
+Als Implied Growth (bijv 4%) lager is dan wat ze kunnen (15%), is het een koopje.
 
-1. Implied Growth (Reverse DCF)
-De kernvraag: "Hoeveel groei prijst de markt in?"
-We gebruiken een omgekeerde Discounted Cash Flow formule:
-- Formule: Implied Growth = Discount Rate (10%) - FCF Yield.
-- Interpretatie: Als de markt slechts 4% groei verwacht (Implied), maar het bedrijf kan makkelijk 15% groeien, is het aandeel goedkoop.
+PERSPECTIEF 2: "WAT KRIJG IK?" (De Frenkel-Methode)
+Variabele: Expected Return (Exp.Ret).
+Vraag: Als de analisten gelijk hebben, wat is dan mijn totaalrendement per jaar?
+Formule: FCF Yield + Analyst Growth Estimate.
+Voorbeeld: 3% dividend/buybacks + 12% winstgroei = 15% Totaal Rendement.
 
-2. Kwaliteit (ROIC)
-De kernvraag: "Hoe efficient is het bedrijf?"
-- Formule: NOPAT / Invested Capital.
-- Norm: >15% is goed. >20% is uitstekend (sterke competitieve positie/Moat).
-
-3. Toekomst (ROIIC & Reinvestment)
-De kernvraag: "Hoeveel waarde creeren ze met NIEUWE investeringen?"
-- Reinvestment Rate: Welk deel van de winst vloeit terug in het bedrijf?
-- Sustainable Growth: ROIC * Reinvestment Rate. (Hoe hard kunnen ze groeien op eigen kracht?).
-
-DEEL 2: DE BESLISBOOM (HOE HET MODEL DENKT)
-
-Scenario A: Het Ideale Plaatje (Cluster 1)
-- Criteria: ROIC > 15% EN Implied Growth < Sustainable Growth.
-- Oordeel: BUY. De markt is te pessimistisch.
-
-Scenario B: De 'Cannibal' (bijv. ASML)
-- Probleem: Bedrijven die eigen aandelen inkopen hebben een negatieve Reinvestment Rate. Formules voor 'Max Groei' slaan dan negatief uit.
-- Oplossing: Als ROIC > 15% is en Reinvest < 0, negeren we de groeiformule. We kijken puur of de Implied Growth redelijk is (<10%).
-- Oordeel: BUY (Quality Cannibal).
-
-Scenario C: Hyper-Groei (bijv. Eli Lilly)
-- Probleem: Bij extreem dure aandelen is de FCF Yield vaak 0%. De Implied Growth formule loopt dan vast op maximaal 10%, terwijl de markt misschien wel 30% verwacht. Het model lijkt dan 'blind'.
-- Oplossing: Als Implied Growth de limiet aantikt (>10%), schakelen we over op de PEG-ratio.
-- Check: Is de PEG < 2.0? Dan is de hoge prijs mogelijk gerechtvaardigd door analistenverwachtingen.
-- Oordeel: BUY (Aggressive Growth) of SPECULATIEF (als PEG > 2.0).
-
-DEEL 3: DATA HERSTEL (PLAN B & C)
-
-Yahoo Finance data is niet altijd compleet. Het script gebruikt een waterval-methode:
-1. Analist Groei: We zoeken eerst naar 'Earnings Estimates'.
-2. Fallback: Als dat ontbreekt, kijken we naar 'Revenue Estimates'.
-3. PEG Ratio: Als die ontbreekt, rekenen we hem zelf uit: (PE Ratio / Verwachte Groei).
-4. Limieten: Groeicijfers boven de 200% worden gewantrouwd (vaak boekhoudkundige ruis) en vervangen door omzetgroei.
+CONCLUSIE
+We zoeken aandelen waar Perspectief 1 'VEILIG' zegt (lage implied growth) en Perspectief 2 'RIJK' zegt (hoog expected return).
     """
     pdf.multi_cell(0, 5, clean_text(explanation))
     
@@ -346,12 +317,11 @@ Yahoo Finance data is niet altijd compleet. Het script gebruikt een waterval-met
 
 # --- DE APP UI ---
 st.set_page_config(page_title="Screener & Report", layout="wide")
-st.title("🚀 Taco & Frenkel - Investment Screener (V22)")
+st.title("🚀 Taco & Frenkel - Investment Screener (V23)")
 st.info("**Instructies:** Tickers komma gescheiden (NVO, ASML). Voor lokaal: .AS of .CO gebruiken.")
 tickers_input = st.text_area("Tickers:", "NVO, LLY, ASML")
 
 if st.button("🚀 Genereer Rapport"):
-    # --- SPION LOG ---
     print(f"👀 BEZOEK ALERT! Iemand zoekt nu op: {tickers_input} -- {datetime.now()}", flush=True)
     
     tickers_list = [t.strip().upper() for t in tickers_input.split(',')]
@@ -361,7 +331,6 @@ if st.button("🚀 Genereer Rapport"):
     progress_bar = st.progress(0)
     
     for i, ticker in enumerate(tickers_list):
-        # Haal data op
         data, error_msg = get_data(ticker)
         
         if data:
@@ -370,9 +339,8 @@ if st.button("🚀 Genereer Rapport"):
         else:
             st.error(f"❌ Fout bij {ticker}: {error_msg}")
         
-        # --- VERTRAGING OM YAHOO TE SPAREN ---
-        if i < len(tickers_list) - 1: # Geen pauze na de laatste
-            time.sleep(2) # Wacht 2 seconden voor het volgende aandeel
+        if i < len(tickers_list) - 1:
+            time.sleep(2) 
             
         progress_bar.progress((i + 1) / len(tickers_list))
     
